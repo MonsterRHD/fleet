@@ -257,10 +257,20 @@ func runRegistration(ctx context.Context, k8s coreInterface, namespace string) (
 
 		secret, err := k8s.Secret().Create(agentSecret)
 		if apierrors.IsAlreadyExists(err) {
-			if err = k8s.Secret().Delete(agentSecret.Namespace, agentSecret.Name, &metav1.DeleteOptions{}); err != nil {
-				return nil, err
+			// A fleet-agent secret already exists, usually the credential
+			// still in use by this or another agent pod during a credential
+			// rotation. Replace it atomically instead of deleting it first:
+			// a delete/create window leaves readers without any credential,
+			// and if the second write fails the agent would have nothing to
+			// fall back to. The new kubeconfig has been verified above, so on
+			// a failed Update the old, still-working credential stays in
+			// place and the registration retry loop can try again.
+			existing, getErr := k8s.Secret().Get(agentSecret.Namespace, agentSecret.Name, metav1.GetOptions{})
+			if getErr != nil {
+				return nil, fmt.Errorf("failed to get existing 'fleet-agent' secret: %w", getErr)
 			}
-			secret, err = k8s.Secret().Create(agentSecret)
+			agentSecret.ResourceVersion = existing.ResourceVersion
+			secret, err = k8s.Secret().Update(agentSecret)
 		}
 		if err != nil {
 			err = fmt.Errorf("failed to create 'fleet-agent' secret: %w", err)

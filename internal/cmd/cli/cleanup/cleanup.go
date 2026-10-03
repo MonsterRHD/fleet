@@ -8,6 +8,7 @@ import (
 	"github.com/jpillora/backoff"
 
 	fleetv1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
+	"github.com/rancher/fleet/pkg/durations"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +24,12 @@ type Options struct {
 	Min    time.Duration
 	Max    time.Duration
 	Factor float64
+	// Grace is how long a granted registration superseded by a newer granted
+	// one is kept before it may be deleted, giving agents time to pick up the
+	// new credential during a rotation. Zero falls back to the controller's
+	// ClusterRegistrationDeleteDelay. Only generations older than the newest
+	// granted one, and beyond this window, are removed.
+	Grace time.Duration
 }
 
 func ClusterRegistrations(ctx context.Context, cl client.Client, opts Options) error {
@@ -69,6 +76,16 @@ func ClusterRegistrations(ctx context.Context, cl client.Client, opts Options) e
 	// granted registration
 	// * requests after that might be in flight
 	// * requests before that are outdated
+	//
+	// A superseded registration is only removed once the newest granted one
+	// has existed for the grace window, mirroring the controller. During a
+	// credential rotation both generations must stay valid long enough for
+	// working agents to pick up the new credential; deleting the older one
+	// immediately would invalidate the token those agents are still using.
+	grace := opts.Grace
+	if grace <= 0 {
+		grace = durations.ClusterRegistrationDeleteDelay
+	}
 	for _, cr := range crList.Items {
 		logger := logger.WithValues("namespace", cr.Namespace, "name", cr.Name)
 		logger.Info("Inspecting cluster registration")
@@ -78,7 +95,7 @@ func ClusterRegistrations(ctx context.Context, cl client.Client, opts Options) e
 
 		clusterKey := types.NamespacedName{Namespace: cr.Namespace, Name: cr.Status.ClusterName}
 		latest, found := latestGranted[clusterKey]
-		if found && cr.CreationTimestamp.Before(&latest) {
+		if found && cr.CreationTimestamp.Before(&latest) && time.Since(latest.Time) >= grace {
 			t := b.Duration()
 			logger.Info("Deleting outdated, granted cluster registration, waiting", "duration", t)
 			time.Sleep(t)

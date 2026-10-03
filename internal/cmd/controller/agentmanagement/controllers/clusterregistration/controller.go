@@ -40,6 +40,16 @@ const (
 	deleteSecretAfter             = durations.ClusterRegistrationDeleteDelay
 )
 
+// oldRegistrationGrace is how long older generations of a ClusterRegistration
+// are retained after a newer, granted generation for the same client ID has
+// appeared. While this overlap window is open, both generations' request
+// service accounts and token Secrets stay valid, so an agent that has not
+// picked up the new credential yet keeps working and a still-registering
+// agent can retry. Only once the window elapses does the newest granted
+// generation prune the older ones, and only those expired generations (plus
+// the resources they own) are removed.
+var oldRegistrationGrace = durations.ClusterRegistrationDeleteDelay
+
 type handler struct {
 	systemNamespace             string
 	systemRegistrationNamespace string
@@ -90,6 +100,7 @@ func Register(ctx context.Context,
 		})
 
 	secret.OnChange(ctx, "registration-expire", h.OnSecretChange)
+	clusterRegistration.OnChange(ctx, "cluster-registration-grace-gc", h.OnRegistrationChange)
 	clusters.OnChange(ctx, "cluster-to-clusterregistration", h.OnCluster)
 	clusters.Cache().AddIndexer(clusterByClientID, func(obj *fleet.Cluster) ([]string, error) {
 		return []string{
@@ -237,16 +248,11 @@ func (h *handler) OnChange(request *fleet.ClusterRegistration, status fleet.Clus
 		return nil, status, nil
 	}
 
-	// delete old cluster registrations
-	crlist, _ := h.clusterRegistration.List(request.Namespace, metav1.ListOptions{})
-	for _, creg := range crlist.Items {
-		if shouldDelete(creg, *request) {
-			log.Log.V(1).Info(fmt.Sprintf("Deleting old clusterregistration '%s/%s', now at '%s'", creg.Namespace, creg.Name, request.Name))
-			if err := h.clusterRegistration.Delete(creg.Namespace, creg.Name, nil); err != nil && !apierrors.IsNotFound(err) {
-				return nil, status, err
-			}
-		}
-	}
+	// Older generations of this client ID's registration are NOT deleted
+	// here. Granting the new request must not invalidate the request
+	// service account token an already working agent is still using while
+	// the credential rotation settles. Superseded generations are reaped
+	// with an overlap grace period by OnRegistrationChange.
 
 	// request is granted, create the registration secret and roles
 	status.ClusterName = cluster.Name
@@ -467,7 +473,113 @@ func (h *handler) OnChange(request *fleet.ClusterRegistration, status fleet.Clus
 	return objs, status, nil
 }
 
-// shouldDelete returns true for any other cluster registration with the same clientID, but different random and older creation timestamp
+// OnRegistrationChange garbage collects superseded ClusterRegistration
+// generations with an overlap grace period. It runs as a separate handler,
+// because the generating handler skips requests that are already granted and
+// would therefore never re-evaluate the window.
+//
+// Only the newest GRANTED generation for a client ID may delete older
+// generations, and only after it has existed for oldRegistrationGrace. This
+// keeps the request service account token of a generation an agent is still
+// using valid while a credential rotation settles, and ensures registration
+// retries (each of which creates another in-flight request and resets the
+// newest generation) never remove the in-use generation. Ungranted requests
+// are ignored, so a failed, half-finished registration cannot delete
+// anything.
+//
+// When a generation is eventually deleted, the generating handler prunes
+// exactly that generation's owned objects (service account, token Secret,
+// registration Secret and RBAC), nothing else.
+func (h *handler) OnRegistrationChange(_ string, request *fleet.ClusterRegistration) (*fleet.ClusterRegistration, error) {
+	if request == nil || !request.Status.Granted || skipClusterRegistration(request) {
+		return request, nil
+	}
+
+	crlist, err := h.clusterRegistration.List(request.Namespace, metav1.ListOptions{})
+	if err != nil {
+		return request, err
+	}
+
+	newest := newestGranted(crlist.Items, request.Spec.ClientID)
+	// Only the newest granted generation schedules and performs the sweep.
+	// If a newer generation exists, it re-enqueues itself when it gets
+	// granted. Deleting from an intermediate generation could remove the
+	// generation the agent is still using while an even newer registration
+	// is in flight.
+	if newest == nil || newest.Name != request.Name {
+		return request, nil
+	}
+
+	if wait := time.Until(newest.CreationTimestamp.Time.Add(oldRegistrationGrace)); wait > 0 {
+		// The overlap window is still open: keep every older generation's
+		// credentials valid and re-check once the window elapses.
+		h.clusterRegistration.EnqueueAfter(newest.Namespace, newest.Name, wait)
+		return request, nil
+	}
+
+	if inFlight := newerInFlight(crlist.Items, newest); inFlight != nil {
+		// A newer registration has been created but is not granted yet, i.e.
+		// an agent is still trying to register. It will either get granted,
+		// resetting the overlap window, or fail. Do not reap the generation
+		// another agent may still be serving with until the in-flight
+		// registration settles.
+		log.Log.V(1).Info(fmt.Sprintf("Keeping expired clusterregistrations for client ID %q, registration '%s/%s' is still in flight",
+			newest.Spec.ClientID, inFlight.Namespace, inFlight.Name))
+		h.clusterRegistration.EnqueueAfter(newest.Namespace, newest.Name, oldRegistrationGrace/2)
+		return request, nil
+	}
+
+	for i := range crlist.Items {
+		creg := crlist.Items[i]
+		if !shouldDelete(creg, *newest) {
+			continue
+		}
+		log.Log.Info(fmt.Sprintf("Deleting expired clusterregistration '%s/%s', superseded by '%s/%s' for longer than the grace period",
+			creg.Namespace, creg.Name, newest.Namespace, newest.Name))
+		if err := h.clusterRegistration.Delete(creg.Namespace, creg.Name, nil); err != nil && !apierrors.IsNotFound(err) {
+			return request, err
+		}
+	}
+
+	return request, nil
+}
+
+// newestGranted returns the most recently created granted ClusterRegistration
+// for the given client ID, or nil if there is none.
+func newestGranted(items []fleet.ClusterRegistration, clientID string) *fleet.ClusterRegistration {
+	var newest *fleet.ClusterRegistration
+	for i := range items {
+		cr := &items[i]
+		if !cr.Status.Granted || cr.Spec.ClientID != clientID {
+			continue
+		}
+		if newest == nil || cr.CreationTimestamp.Time.After(newest.CreationTimestamp.Time) {
+			newest = cr
+		}
+	}
+	return newest
+}
+
+// newerInFlight returns an ungranted ClusterRegistration for clientID that
+// is newer than newestGranted, if one exists. Such a request means an agent
+// is still trying to register, so older generations must not be reaped yet.
+func newerInFlight(items []fleet.ClusterRegistration, newestGranted *fleet.ClusterRegistration) *fleet.ClusterRegistration {
+	for i := range items {
+		cr := &items[i]
+		if cr.Status.Granted || cr.Spec.ClientID != newestGranted.Spec.ClientID {
+			continue
+		}
+		if cr.CreationTimestamp.Time.After(newestGranted.CreationTimestamp.Time) {
+			return cr
+		}
+	}
+	return nil
+}
+
+// shouldDelete returns true for any other granted-or-not cluster registration
+// with the same clientID, but different random and an older creation
+// timestamp. Callers only invoke it from the newest granted generation and
+// only after the overlap grace period, see OnRegistrationChange.
 func shouldDelete(creg fleet.ClusterRegistration, request fleet.ClusterRegistration) bool {
 	return creg.Spec.ClientID == request.Spec.ClientID &&
 		creg.Spec.ClientRandom != request.Spec.ClientRandom &&

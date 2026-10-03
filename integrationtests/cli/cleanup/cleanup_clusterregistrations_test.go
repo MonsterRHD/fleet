@@ -48,7 +48,10 @@ var _ = Describe("Fleet CLI clusterregistration cleanup", Ordered, func() {
 
 	When("cleaning up", func() {
 		BeforeEach(func() {
-			options = cleanup.Options{Min: 1, Max: 1}
+			// Use a short overlap grace so superseded registrations are
+			// reaped within the spec; production defaults to the controller's
+			// 40 minute ClusterRegistrationDeleteDelay.
+			options = cleanup.Options{Min: 1, Max: 1, Grace: 500 * time.Millisecond}
 			clusters = []fleetv1.Cluster{
 				{
 					ObjectMeta: metav1.ObjectMeta{

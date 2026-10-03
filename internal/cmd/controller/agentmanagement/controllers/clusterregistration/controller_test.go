@@ -2,6 +2,7 @@ package clusterregistration
 
 import (
 	"errors"
+	"time"
 
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	"github.com/rancher/wrangler/v3/pkg/generic/fake"
@@ -233,8 +234,6 @@ var _ = Describe("ClusterRegistration OnChange", func() {
 				}
 				secretController.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(secret, nil)
 
-				clusterRegistrationController.EXPECT().List(gomock.Any(), gomock.Any()).Return(&fleet.ClusterRegistrationList{}, nil)
-
 				clusterRegistrationController.EXPECT().Update(gomock.Any()).Return(&fleet.ClusterRegistration{}, nil)
 			})
 
@@ -333,7 +332,6 @@ var _ = Describe("ClusterRegistration OnChange", func() {
 				secret := &corev1.Secret{Data: map[string][]byte{"token": []byte("secrettoken")}}
 				secretController.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(secret, nil)
 
-				clusterRegistrationController.EXPECT().List(gomock.Any(), gomock.Any()).Return(&fleet.ClusterRegistrationList{}, nil)
 				clusterRegistrationController.EXPECT().Update(gomock.Any()).DoAndReturn(
 					func(cr *fleet.ClusterRegistration) (*fleet.ClusterRegistration, error) { return cr, nil },
 				)
@@ -402,7 +400,6 @@ var _ = Describe("ClusterRegistration OnChange", func() {
 				secret := &corev1.Secret{Data: map[string][]byte{"token": []byte("secrettoken")}}
 				secretController.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(secret, nil)
 
-				clusterRegistrationController.EXPECT().List(gomock.Any(), gomock.Any()).Return(&fleet.ClusterRegistrationList{}, nil)
 				clusterRegistrationController.EXPECT().Update(gomock.Any()).DoAndReturn(
 					func(cr *fleet.ClusterRegistration) (*fleet.ClusterRegistration, error) { return cr, nil },
 				)
@@ -431,5 +428,144 @@ var _ = Describe("ClusterRegistration OnChange", func() {
 				}
 			})
 		})
+	})
+})
+
+var _ = Describe("OnRegistrationChange grace garbage collection", func() {
+	const namespace = "fleet-default"
+
+	var (
+		gomockCtrl    *gomock.Controller
+		crController  *fake.MockControllerInterface[*fleet.ClusterRegistration, *fleet.ClusterRegistrationList]
+		h             *handler
+		originalGrace time.Duration
+		gcErr         = errors.New("gc failed")
+	)
+
+	BeforeEach(func() {
+		gomockCtrl = gomock.NewController(GinkgoT())
+		crController = fake.NewMockControllerInterface[*fleet.ClusterRegistration, *fleet.ClusterRegistrationList](gomockCtrl)
+		h = &handler{clusterRegistration: crController}
+		originalGrace = oldRegistrationGrace
+		DeferCleanup(func() { oldRegistrationGrace = originalGrace })
+	})
+
+	// registration builds a ClusterRegistration createdAgo ago, granted when
+	// granted is true.
+	registration := func(name, clientID, clientRandom string, createdAgo time.Duration, granted bool) *fleet.ClusterRegistration {
+		return &fleet.ClusterRegistration{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         namespace,
+				CreationTimestamp: metav1.NewTime(time.Now().Add(-createdAgo)),
+			},
+			Spec: fleet.ClusterRegistrationSpec{
+				ClientID:     clientID,
+				ClientRandom: clientRandom,
+			},
+			Status: fleet.ClusterRegistrationStatus{
+				Granted:     granted,
+				ClusterName: "cluster-" + clientID,
+			},
+		}
+	}
+
+	It("does nothing for ungranted registrations", func() {
+		ungranted := registration("request-inflight", "client-id", "random", time.Minute, false)
+		_, err := h.OnRegistrationChange(namespace+"/request-inflight", ungranted)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("does nothing for registrations owned by another cluster manager", func() {
+		external := registration("request-external", "client-id", "random", time.Minute, true)
+		external.Labels = map[string]string{fleet.ClusterManagementLabel: "custom-manager"}
+		_, err := h.OnRegistrationChange(namespace+"/request-external", external)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("keeps older generations and reschedules while the newest granted generation is within the grace window", func() {
+		newest := registration("request-new", "client-id", "new", time.Minute, true)
+		older := registration("request-old", "client-id", "old", 2*time.Hour, true)
+
+		crController.EXPECT().List(namespace, gomock.Any()).
+			Return(&fleet.ClusterRegistrationList{Items: []fleet.ClusterRegistration{*older, *newest}}, nil)
+		crController.EXPECT().EnqueueAfter(namespace, "request-new", gomock.Any())
+
+		_, err := h.OnRegistrationChange(namespace+"/request-new", newest)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("neither reschedules nor deletes when a newer granted generation exists", func() {
+		newest := registration("request-new", "client-id", "new", 2*time.Hour, true)
+		older := registration("request-old", "client-id", "old", 3*time.Hour, true)
+
+		crController.EXPECT().List(namespace, gomock.Any()).
+			Return(&fleet.ClusterRegistrationList{Items: []fleet.ClusterRegistration{*older, *newest}}, nil)
+
+		_, err := h.OnRegistrationChange(namespace+"/request-old", older)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("defers the sweep past the grace window while a newer registration is still in flight", func() {
+		oldRegistrationGrace = 40 * time.Minute
+		newest := registration("request-new", "client-id", "new", 41*time.Minute, true)
+		older := registration("request-old", "client-id", "old", 3*time.Hour, true)
+		// a retry created another request, which the controller has not
+		// granted yet (e.g. its service account token is not populated)
+		inflight := registration("request-inflight", "client-id", "inflight", 10*time.Minute, false)
+
+		crController.EXPECT().List(namespace, gomock.Any()).
+			Return(&fleet.ClusterRegistrationList{Items: []fleet.ClusterRegistration{*older, *inflight, *newest}}, nil)
+		crController.EXPECT().EnqueueAfter(namespace, "request-new", gomock.Any())
+
+		_, err := h.OnRegistrationChange(namespace+"/request-new", newest)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("deletes only expired generations of the same client ID once the grace window elapsed", func() {
+		oldRegistrationGrace = 40 * time.Minute
+		newest := registration("request-new", "client-id", "new", 41*time.Minute, true)
+		oldInUse := registration("request-old", "client-id", "old", 3*time.Hour, true)
+		otherClient := registration("request-other", "other-client-id", "other", 3*time.Hour, true)
+		// ungranted, stale attempts older than the newest generation are
+		// reaped too, but same-client-ID only
+		staleAttempt := registration("request-stale", "client-id", "stale", 2*time.Hour, false)
+		// a registration born in the same second as the newest one cannot be
+		// ordered reliably and must stay
+		sameSecond := registration("request-same-second", "client-id", "same", 41*time.Minute, true)
+		sameSecond.CreationTimestamp = newest.CreationTimestamp
+
+		crController.EXPECT().List(namespace, gomock.Any()).
+			Return(&fleet.ClusterRegistrationList{Items: []fleet.ClusterRegistration{
+				*newest, *oldInUse, *otherClient, *staleAttempt, *sameSecond,
+			}}, nil)
+		crController.EXPECT().Delete(namespace, "request-old", gomock.Any()).Return(nil)
+		crController.EXPECT().Delete(namespace, "request-stale", gomock.Any()).Return(nil)
+
+		_, err := h.OnRegistrationChange(namespace+"/request-new", newest)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("ignores NotFound while reaping but propagates other deletion errors", func() {
+		oldRegistrationGrace = time.Minute
+		newest := registration("request-new", "client-id", "new", 2*time.Minute, true)
+		gone := registration("request-gone", "client-id", "gone", 3*time.Hour, true)
+		failing := registration("request-failing", "client-id", "failing", 4*time.Hour, true)
+
+		crController.EXPECT().List(namespace, gomock.Any()).
+			Return(&fleet.ClusterRegistrationList{Items: []fleet.ClusterRegistration{*newest, *gone, *failing}}, nil)
+		// iteration order follows the list order above
+		crController.EXPECT().Delete(namespace, "request-gone", gomock.Any()).Return(apierrors.NewNotFound(schema.GroupResource{}, ""))
+		crController.EXPECT().Delete(namespace, "request-failing", gomock.Any()).Return(gcErr)
+
+		_, err := h.OnRegistrationChange(namespace+"/request-new", newest)
+		Expect(err).To(MatchError(gcErr))
+	})
+
+	It("propagates list errors", func() {
+		newest := registration("request-new", "client-id", "new", 2*time.Hour, true)
+		crController.EXPECT().List(namespace, gomock.Any()).Return(nil, gcErr)
+		_, err := h.OnRegistrationChange(namespace+"/request-new", newest)
+		Expect(err).To(MatchError(gcErr))
 	})
 })

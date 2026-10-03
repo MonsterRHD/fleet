@@ -494,7 +494,7 @@ var _ = Describe("ClusterRegistration", func() {
 	})
 
 	Describe("re-registration", func() {
-		It("supersedes the older registration for the same client ID and removes everything it was granted", func() {
+		It("keeps the older registration and everything it was granted until the overlap grace period elapses", func() {
 			const clientID = "re-registering-client-id"
 
 			first := newClusterRegistration(regNamespace, "first-request", clientID, "random-first")
@@ -515,12 +515,18 @@ var _ = Describe("ClusterRegistration", func() {
 			secondCluster, secondSAName := grantRegistration(second, "second-sa-token")
 			Expect(secondCluster.Name).To(Equal(cluster.Name))
 
-			By("deleting the superseded registration")
-			objectGone(first).Should(Succeed())
+			present := func(obj client.Object) func(Gomega) {
+				return func(g Gomega) {
+					g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(obj), obj)).To(Succeed())
+				}
+			}
 
-			By("pruning everything the superseded registration owned")
+			By("keeping the superseded registration during the overlap window")
+			consistently(present(first)).Should(Succeed())
+
+			By("keeping everything the superseded registration was granted, so its token still works")
 			for _, obj := range firstObjects {
-				objectGone(obj).Should(Succeed())
+				consistently(present(obj)).Should(Succeed())
 			}
 
 			By("leaving the current registration's own resources in place")
