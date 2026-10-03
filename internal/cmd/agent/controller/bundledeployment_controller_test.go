@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/rancher/fleet/internal/cmd/agent/deployer"
+	"github.com/rancher/fleet/internal/cmd/agent/deployer/monitor"
+	"github.com/rancher/fleet/internal/helmdeployer"
 	"github.com/rancher/fleet/pkg/durations"
 
 	fleetv1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
@@ -412,4 +414,110 @@ func TestStaleCacheHits(t *testing.T) {
 	if got := r.recordStaleCacheHit(key); got != 1 {
 		t.Errorf("recordStaleCacheHit() after forgetting = %d, expected 1", got)
 	}
+}
+
+func TestDeployedConditionReason(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "dependency wait gets its reason",
+			err:  &deployer.NotReadyDependenciesError{},
+			want: fleetv1.BundleDeploymentReasonWaitingForDependency,
+		},
+		{
+			name: "missing valuesFrom sources get the waiting reason",
+			err: &helmdeployer.WaitingForValuesFromError{Pending: []helmdeployer.PendingValuesFrom{{
+				Kind: "ConfigMap", Name: "cm-missing", Namespace: "ns", Key: "values.yaml", Reason: helmdeployer.PendingValuesFromNotFound,
+			}}},
+			want: fleetv1.BundleDeploymentReasonWaitingForValuesFrom,
+		},
+		{
+			name: "any other error keeps the default reason",
+			err:  errors.New("boom"),
+			want: "",
+		},
+		{
+			name: "no error keeps the default reason",
+			err:  nil,
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, deployedConditionReason(tc.err))
+		})
+	}
+}
+
+// TestRequeueIfWaitingForValuesFrom verifies that a bundle deployment blocked
+// on missing or empty valuesFrom sources is requeued with the wait interval,
+// records the wait on its Deployed condition and does not advance the applied
+// deployment ID, so the same revision is deployed once the sources recover.
+func TestRequeueIfWaitingForValuesFrom(t *testing.T) {
+	scheme := downstreamResourcesScheme(t)
+	require.NoError(t, fleetv1.AddToScheme(scheme))
+
+	newBD := func() *fleetv1.BundleDeployment {
+		return &fleetv1.BundleDeployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "bd-1", Namespace: "cluster-ns"},
+			Spec: fleetv1.BundleDeploymentSpec{
+				DeploymentID:       "rev-2",
+				StagedDeploymentID: "rev-2",
+			},
+			Status: fleetv1.BundleDeploymentStatus{
+				// the previous revision stays applied while waiting
+				AppliedDeploymentID: "rev-1",
+			},
+		}
+	}
+
+	waitErr := &helmdeployer.WaitingForValuesFromError{Pending: []helmdeployer.PendingValuesFrom{{
+		Kind: "Secret", Name: "sec-missing", Namespace: "cluster-ns", Key: "values.yaml", Reason: helmdeployer.PendingValuesFromNotFound,
+	}}}
+
+	t.Run("waits and persists the condition", func(t *testing.T) {
+		bd := newBD()
+		c := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(bd).
+			WithStatusSubresource(&fleetv1.BundleDeployment{}).
+			Build()
+		r := &BundleDeploymentReconciler{Client: c}
+
+		// mirror what Reconcile does: orig is captured before the condition is set
+		orig := bd.DeepCopy()
+		bd.Status = setConditionWithReason(bd.Status, waitErr, deployedConditionReason(waitErr), monitor.Cond(fleetv1.BundleDeploymentConditionDeployed))
+
+		handled, res, err := r.requeueIfWaitingForValuesFrom(context.Background(), orig, bd, waitErr)
+		require.True(t, handled)
+		require.NoError(t, err)
+		assert.Equal(t, durations.WaitForValuesFromRequeueInterval, res.RequeueAfter)
+
+		// the applied revision is preserved
+		assert.Equal(t, "rev-1", bd.Status.AppliedDeploymentID)
+
+		stored := &fleetv1.BundleDeployment{}
+		require.NoError(t, c.Get(context.Background(), client.ObjectKeyFromObject(bd), stored))
+		assert.Equal(t, "rev-1", stored.Status.AppliedDeploymentID, "the applied revision must not advance while waiting")
+		assert.Equal(t, "rev-2", stored.Spec.DeploymentID, "the staged revision must be preserved while waiting")
+		assert.Equal(t, "rev-2", stored.Spec.StagedDeploymentID, "the staged revision must be preserved while waiting")
+
+		cond := monitor.Cond(fleetv1.BundleDeploymentConditionDeployed)
+		assert.True(t, cond.IsFalse(stored))
+		assert.Equal(t, fleetv1.BundleDeploymentReasonWaitingForValuesFrom, cond.GetReason(stored))
+		assert.Contains(t, cond.GetMessage(stored), "secret cluster-ns/sec-missing not found")
+	})
+
+	t.Run("other errors are not handled here", func(t *testing.T) {
+		bd := newBD()
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(bd).Build()
+		r := &BundleDeploymentReconciler{Client: c}
+
+		handled, _, err := r.requeueIfWaitingForValuesFrom(context.Background(), bd.DeepCopy(), bd, errors.New("boom"))
+		assert.False(t, handled)
+		assert.NoError(t, err)
+	})
 }

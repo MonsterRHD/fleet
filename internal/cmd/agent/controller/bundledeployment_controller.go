@@ -13,6 +13,7 @@ import (
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/cleanup"
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/driftdetect"
 	"github.com/rancher/fleet/internal/cmd/agent/deployer/monitor"
+	"github.com/rancher/fleet/internal/helmdeployer"
 	"github.com/rancher/fleet/internal/namespaces"
 	fleetv1 "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	"github.com/rancher/fleet/pkg/durations"
@@ -335,6 +336,9 @@ func (r *BundleDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		bd.Status = setConditionWithReason(bd.Status, err, deployedConditionReason(err), monitor.Cond(fleetv1.BundleDeploymentConditionDeployed))
 
 		if handled, res, err := r.requeueIfDependenciesNotReady(ctx, orig, bd, err); handled {
+			return res, err
+		}
+		if handled, res, err := r.requeueIfWaitingForValuesFrom(ctx, orig, bd, err); handled {
 			return res, err
 		}
 
@@ -752,6 +756,29 @@ func (r *BundleDeploymentReconciler) requeueIfDependenciesNotReady(ctx context.C
 	return true, ctrl.Result{RequeueAfter: durations.WaitForDependenciesReadyRequeueInterval}, nil
 }
 
+// requeueIfWaitingForValuesFrom handles a bundle whose helm.valuesFrom
+// ConfigMaps or Secrets cannot all be resolved yet. This is a temporary wait,
+// not a deployment failure: the Helm deployer returns before touching the
+// release, so already resolved values are not deployed over and the current
+// release, the staged options and the DeploymentID all stay unchanged. The
+// Deployed condition records the wait (aggregated as WaitApplied by the
+// management controller), the status is persisted and the bundle deployment is
+// requeued until the sources recover, at which point the same revision is
+// deployed. Returns handled=false when err is not a WaitingForValuesFromError.
+func (r *BundleDeploymentReconciler) requeueIfWaitingForValuesFrom(ctx context.Context, orig, bd *fleetv1.BundleDeployment, err error) (bool, ctrl.Result, error) {
+	var waitingForValuesFromError *helmdeployer.WaitingForValuesFromError
+	if !errors.As(err, &waitingForValuesFromError) {
+		return false, ctrl.Result{}, nil
+	}
+
+	if err := r.updateStatus(ctx, orig, bd); err != nil {
+		return true, ctrl.Result{}, err
+	}
+
+	log.FromContext(ctx).V(1).Info("One or more valuesFrom sources are missing or empty, requeuing...", "pending", waitingForValuesFromError.PendingDescriptions())
+	return true, ctrl.Result{RequeueAfter: durations.WaitForValuesFromRequeueInterval}, nil
+}
+
 // setCondition sets the condition and updates the timestamp, if the condition changed
 func setCondition(newStatus fleetv1.BundleDeploymentStatus, err error, cond monitor.Cond) fleetv1.BundleDeploymentStatus {
 	return setConditionWithReason(newStatus, err, "", cond)
@@ -766,12 +793,16 @@ func setConditionWithReason(newStatus fleetv1.BundleDeploymentStatus, err error,
 }
 
 // deployedConditionReason returns the reason to record on the Deployed
-// condition for a failed deployment. Waiting on a dependency gets a dedicated
-// reason, so the bundledeployment is reported as WaitingForDependency instead
-// of the misleading ErrApplied. Any other error keeps the default "Error".
+// condition for a failed deployment. Waiting on a dependency or on missing
+// valuesFrom sources gets a dedicated reason, so the bundledeployment is
+// reported as WaitingForDependency or WaitApplied instead of the misleading
+// ErrApplied. Any other error keeps the default "Error".
 func deployedConditionReason(err error) string {
 	if _, ok := errors.AsType[*deployer.NotReadyDependenciesError](err); ok {
 		return fleetv1.BundleDeploymentReasonWaitingForDependency
+	}
+	if _, ok := errors.AsType[*helmdeployer.WaitingForValuesFromError](err); ok {
+		return fleetv1.BundleDeploymentReasonWaitingForValuesFrom
 	}
 
 	return ""

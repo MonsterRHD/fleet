@@ -154,6 +154,10 @@ func TestGetDeploymentState(t *testing.T) {
 			bd:   notApplied("False", fleet.BundleDeploymentReasonWaitingForDependency),
 			want: fleet.WaitingForDependency,
 		},
+		"waiting for valuesFrom sources is WaitApplied, not an error": {
+			bd:   notApplied("False", fleet.BundleDeploymentReasonWaitingForValuesFrom),
+			want: fleet.WaitApplied,
+		},
 		"a failed deployment is still ErrApplied": {
 			bd:   notApplied("False", "Error"),
 			want: fleet.ErrApplied,
@@ -185,6 +189,37 @@ func TestGetDeploymentState(t *testing.T) {
 	// from the resources.
 	t.Run("reason is ignored once the deployment ID is applied", func(t *testing.T) {
 		bd := notApplied("False", fleet.BundleDeploymentReasonWaitingForDependency)
+		bd.Status.AppliedDeploymentID = bd.Spec.DeploymentID
+		bd.Spec.StagedDeploymentID = bd.Spec.DeploymentID
+		bd.Status.Ready = true
+		bd.Status.NonModified = true
+
+		if got := summary.GetDeploymentState(bd); got != fleet.Ready {
+			t.Errorf("GetDeploymentState() = %s, want Ready", got)
+		}
+	})
+
+	// Unlike a dependency wait, missing valuesFrom sources keep an otherwise
+	// healthy, already applied deployment in WaitApplied: the agent must not
+	// re-render with partial values (e.g. a source disappears between forced
+	// re-deploys).
+	t.Run("waiting for valuesFrom is WaitApplied even when the revision is already applied", func(t *testing.T) {
+		bd := notApplied("False", fleet.BundleDeploymentReasonWaitingForValuesFrom)
+		bd.Status.AppliedDeploymentID = bd.Spec.DeploymentID
+		bd.Spec.StagedDeploymentID = bd.Spec.DeploymentID
+		bd.Status.Ready = true
+		bd.Status.NonModified = true
+
+		if got := summary.GetDeploymentState(bd); got != fleet.WaitApplied {
+			t.Errorf("GetDeploymentState() = %s, want WaitApplied", got)
+		}
+	})
+
+	// Once the sources recover and the agent deploys successfully, the
+	// Deployed condition becomes True and the deployment is Ready again with
+	// the same revision.
+	t.Run("waiting for valuesFrom clears on a successful deployment", func(t *testing.T) {
+		bd := notApplied("True", fleet.BundleDeploymentReasonWaitingForValuesFrom)
 		bd.Status.AppliedDeploymentID = bd.Spec.DeploymentID
 		bd.Spec.StagedDeploymentID = bd.Spec.DeploymentID
 		bd.Status.Ready = true

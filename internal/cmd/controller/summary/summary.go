@@ -90,9 +90,21 @@ func GetSummaryState(summary fleet.BundleSummary) fleet.BundleState {
 
 // GetDeploymentState calculates a fleet.BundleState from bundleDeployment (pure function)
 func GetDeploymentState(bundleDeployment *fleet.BundleDeployment) fleet.BundleState {
+	deployed := condition.Cond(fleet.BundleDeploymentConditionDeployed)
+
+	// The agent is waiting for one of the bundle's helm.valuesFrom
+	// ConfigMaps or Secrets to become available. That is a temporary hold,
+	// not an apply failure, so it is reported as WaitApplied regardless of
+	// whether a previous revision was already applied (e.g. a source
+	// disappears between forced re-deploys). The reason is cleared by the
+	// agent on the next successful deployment.
+	if deployed.IsFalse(bundleDeployment) &&
+		deployed.GetReason(bundleDeployment) == fleet.BundleDeploymentReasonWaitingForValuesFrom {
+		return fleet.WaitApplied
+	}
+
 	switch {
 	case bundleDeployment.Status.AppliedDeploymentID != bundleDeployment.Spec.DeploymentID:
-		deployed := condition.Cond(fleet.BundleDeploymentConditionDeployed)
 		if deployed.IsFalse(bundleDeployment) {
 			// The agent blocks on dependencies before deploying. That is
 			// a temporary wait, not a deployment error, and it gets its

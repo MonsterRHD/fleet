@@ -3,6 +3,7 @@ package helmdeployer
 import (
 	"context"
 	"fmt"
+	"io"
 	"runtime"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"helm.sh/helm/v4/pkg/kube"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 
@@ -774,4 +776,283 @@ func TestTemplate_LeadingComment(t *testing.T) {
 	release, err := Template(context.Background(), "test-bundle", m, opts, "v1.25.0")
 	require.NoError(t, err)
 	require.Contains(t, release.Manifest, "kind: ConfigMap")
+}
+
+// TestGetValuesMultipleSourcesMergedInDeclarationOrder verifies that several
+// valuesFrom sources are merged in their declaration order: keys from later
+// sources override earlier ones, nested maps are deep merged and scalars or
+// slices replace the earlier value. Within one valuesFrom entry the secret is
+// still merged after the configmap (fleet <= 0.6.0 compatibility).
+func TestGetValuesMultipleSourcesMergedInDeclarationOrder(t *testing.T) {
+	const ns = "merge-ns"
+
+	cmFirst := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-first", Namespace: ns},
+		Data: map[string]string{
+			DefaultKey: "shared:\n  a: from-cm-first\n  b: cm-first-only\nscalar: cm-first\nlist:\n  - cm-first\nonlyFirst: first-only\n",
+		},
+	}
+	secSecond := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec-second", Namespace: ns},
+		Data: map[string][]byte{
+			DefaultKey: []byte("shared:\n  a: from-sec-second\n  c: sec-second-only\nscalar: sec-second\nlist:\n  - sec-second\n"),
+		},
+	}
+	cmThird := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-third", Namespace: ns},
+		Data: map[string]string{
+			DefaultKey: "shared:\n  a: from-cm-third\nscalar: cm-third\nonlyThird: true\n",
+		},
+	}
+	// One entry references both a configmap and a secret. The secret must win.
+	cmEntry := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-entry", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "entry: from-configmap\nfromConfigMap: from-configmap\n"},
+	}
+	secEntry := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec-entry", Namespace: ns},
+		Data:       map[string][]byte{DefaultKey: []byte("entry: from-secret\nfromSecret: from-secret\n")},
+	}
+
+	kubeClient := kubernetesfake.NewSimpleClientset(cmFirst, secSecond, cmThird, cmEntry, secEntry)
+	h := &Helm{}
+
+	opts := fleet.BundleDeploymentOptions{
+		Helm: &fleet.HelmOptions{
+			Values: &fleet.GenericMap{Data: map[string]any{
+				"base":   true,
+				"scalar": "inline",
+				"shared": map[string]any{"baseKey": "keep"},
+			}},
+			ValuesFrom: []fleet.ValuesFrom{
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-first"}, Namespace: ns}},
+				{SecretKeyRef: &fleet.SecretKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "sec-second"}, Namespace: ns}},
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-third"}, Namespace: ns}},
+				{
+					ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-entry"}, Namespace: ns},
+					SecretKeyRef:    &fleet.SecretKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "sec-entry"}, Namespace: ns},
+				},
+			},
+		},
+	}
+
+	values, err := h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.NoError(t, err)
+
+	expected := map[string]any{
+		"base":          true,
+		"onlyFirst":     "first-only",
+		"onlyThird":     true,
+		"fromConfigMap": "from-configmap",
+		"fromSecret":    "from-secret",
+		// last source in declaration order wins
+		"scalar": "cm-third",
+		// the secret of the final entry overrides its configmap
+		"entry": "from-secret",
+		// slices are replaced, not concatenated
+		"list": []any{"sec-second"},
+		"shared": map[string]any{
+			"baseKey": "keep",
+			"b":       "cm-first-only",
+			"c":       "sec-second-only",
+			"a":       "from-cm-third",
+		},
+	}
+	assert.Equal(t, expected, values)
+}
+
+// TestGetValuesMultipleSourcesMissingOrEmptyWaits verifies that with several
+// valuesFrom sources, missing objects, missing keys and empty documents do not
+// fail the deployment: they are all reported as pending, while the values
+// resolved from the sources that are present (merged in declaration order) are
+// retained. Once the sources recover, the next pass merges everything without
+// touching the options, i.e. it keeps producing the same deployment revision.
+func TestGetValuesMultipleSourcesMissingOrEmptyWaits(t *testing.T) {
+	const ns = "wait-ns"
+
+	cmPresent := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-present", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "present: present-value\nshared:\n  a: present\n"},
+	}
+	secNoKey := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec-nokey", Namespace: ns},
+		Data:       map[string][]byte{"other-key": []byte("unused")},
+	}
+	cmEmpty := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-empty", Namespace: ns},
+		Data:       map[string]string{DefaultKey: ""},
+	}
+	secBlank := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec-blank", Namespace: ns},
+		Data:       map[string][]byte{DefaultKey: []byte("  \n")},
+	}
+	cmLater := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-later", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "later: true"},
+	}
+	// "cm-missing" deliberately does not exist.
+
+	kubeClient := kubernetesfake.NewSimpleClientset(cmPresent, secNoKey, cmEmpty, secBlank, cmLater)
+	h := &Helm{}
+
+	opts := fleet.BundleDeploymentOptions{
+		Helm: &fleet.HelmOptions{
+			Values: &fleet.GenericMap{Data: map[string]any{"inline": "kept"}},
+			ValuesFrom: []fleet.ValuesFrom{
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-present"}, Namespace: ns}},
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-missing"}, Namespace: ns}},
+				{SecretKeyRef: &fleet.SecretKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "sec-nokey"}, Namespace: ns}},
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-empty"}, Namespace: ns}},
+				{SecretKeyRef: &fleet.SecretKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "sec-blank"}, Namespace: ns}},
+				{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-later"}, Namespace: ns}},
+			},
+		},
+	}
+
+	values, err := h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	var waitErr *WaitingForValuesFromError
+	require.ErrorAs(t, err, &waitErr)
+
+	// already resolved values are not cleared
+	assert.Equal(t, map[string]any{
+		"inline":  "kept",
+		"present": "present-value",
+		"shared":  map[string]any{"a": "present"},
+		"later":   true,
+	}, values)
+	assert.Equal(t, values, waitErr.Values)
+
+	require.Len(t, waitErr.Pending, 4)
+	assert.Equal(t, PendingValuesFrom{Kind: "ConfigMap", Name: "cm-missing", Namespace: ns, Key: DefaultKey, Reason: PendingValuesFromNotFound}, waitErr.Pending[0])
+	assert.Equal(t, PendingValuesFrom{Kind: "Secret", Name: "sec-nokey", Namespace: ns, Key: DefaultKey, Reason: PendingValuesFromKeyMissing}, waitErr.Pending[1])
+	assert.Equal(t, PendingValuesFrom{Kind: "ConfigMap", Name: "cm-empty", Namespace: ns, Key: DefaultKey, Reason: PendingValuesFromEmpty}, waitErr.Pending[2])
+	assert.Equal(t, PendingValuesFrom{Kind: "Secret", Name: "sec-blank", Namespace: ns, Key: DefaultKey, Reason: PendingValuesFromEmpty}, waitErr.Pending[3])
+	assert.Len(t, waitErr.PendingDescriptions(), 4)
+	assert.Contains(t, err.Error(), "configmap wait-ns/cm-missing not found")
+
+	// Sources recover: the next reconcile pass merges all sources in order
+	// with the same options, hence with the same deployment revision.
+	_, err = kubeClient.CoreV1().ConfigMaps(ns).Create(context.TODO(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-missing", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "missing: recovered\nshared:\n  a: recovered\n"},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	secNoKey.Data[DefaultKey] = []byte("nokey: recovered")
+	_, err = kubeClient.CoreV1().Secrets(ns).Update(context.TODO(), secNoKey, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	cmEmpty.Data[DefaultKey] = "empty: recovered"
+	_, err = kubeClient.CoreV1().ConfigMaps(ns).Update(context.TODO(), cmEmpty, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	secBlank.Data[DefaultKey] = []byte("blank: recovered")
+	_, err = kubeClient.CoreV1().Secrets(ns).Update(context.TODO(), secBlank, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	values, err = h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{
+		"inline":  "kept",
+		"present": "present-value",
+		"missing": "recovered",
+		"nokey":   "recovered",
+		"empty":   "recovered",
+		"blank":   "recovered",
+		"later":   true,
+		// cm-present is declared before cm-missing, so the recovered source
+		// overrides it, in declaration order.
+		"shared": map[string]any{"a": "recovered"},
+	}, values)
+}
+
+// TestGetValuesSingleSourceKeepsLegacyBehavior ensures that bundles with no or
+// a single valuesFrom source keep the historical hard-error behaviour when the
+// source is missing or unusable: the new waiting semantics only applies to
+// multi-source bundles.
+func TestGetValuesSingleSourceKeepsLegacyBehavior(t *testing.T) {
+	const ns = "legacy-ns"
+
+	secNoKey := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "sec-nokey", Namespace: ns},
+		Data:       map[string][]byte{"other-key": []byte("unused")},
+	}
+	cmEmpty := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-empty", Namespace: ns},
+		Data:       map[string]string{DefaultKey: ""},
+	}
+	cmBlank := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-blank", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "   \n"},
+	}
+
+	kubeClient := kubernetesfake.NewSimpleClientset(secNoKey, cmEmpty, cmBlank)
+	h := &Helm{}
+
+	// referenced object does not exist
+	opts := fleet.BundleDeploymentOptions{Helm: &fleet.HelmOptions{
+		ValuesFrom: []fleet.ValuesFrom{
+			{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-missing"}, Namespace: ns}},
+		},
+	}}
+	_, err := h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.Error(t, err)
+	assert.True(t, apierrors.IsNotFound(err))
+	assert.NotContains(t, err.Error(), "waiting for valuesFrom")
+
+	// key missing from an existing secret: same message as before
+	opts = fleet.BundleDeploymentOptions{Helm: &fleet.HelmOptions{
+		ValuesFrom: []fleet.ValuesFrom{
+			{SecretKeyRef: &fleet.SecretKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "sec-nokey"}, Namespace: ns}},
+		},
+	}}
+	_, err = h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.EqualError(t, err, "key values.yaml is missing from secret "+ns+"/sec-nokey, can't use it in valuesFrom")
+
+	// empty document: EOF error as before
+	opts = fleet.BundleDeploymentOptions{Helm: &fleet.HelmOptions{
+		ValuesFrom: []fleet.ValuesFrom{
+			{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-empty"}, Namespace: ns}},
+		},
+	}}
+	_, err = h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.ErrorIs(t, err, io.EOF)
+
+	// whitespace-only document: silently skipped as before
+	opts = fleet.BundleDeploymentOptions{Helm: &fleet.HelmOptions{
+		Values: &fleet.GenericMap{Data: map[string]any{"inline": "kept"}},
+		ValuesFrom: []fleet.ValuesFrom{
+			{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-blank"}, Namespace: ns}},
+		},
+	}}
+	values, err := h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]any{"inline": "kept"}, values)
+}
+
+// TestGetValuesMultipleSourcesMalformedIsHardError ensures that a source with
+// malformed content fails the deployment even with several sources: only
+// missing or empty sources are retriable.
+func TestGetValuesMultipleSourcesMalformedIsHardError(t *testing.T) {
+	const ns = "bad-ns"
+
+	cmBad := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-bad", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "a: [1, 2"},
+	}
+	cmGood := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm-good", Namespace: ns},
+		Data:       map[string]string{DefaultKey: "good: yes"},
+	}
+
+	kubeClient := kubernetesfake.NewSimpleClientset(cmBad, cmGood)
+	h := &Helm{}
+
+	opts := fleet.BundleDeploymentOptions{Helm: &fleet.HelmOptions{
+		ValuesFrom: []fleet.ValuesFrom{
+			{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-bad"}, Namespace: ns}},
+			{ConfigMapKeyRef: &fleet.ConfigMapKeySelector{LocalObjectReference: fleet.LocalObjectReference{Name: "cm-good"}, Namespace: ns}},
+		},
+	}}
+
+	_, err := h.getValues(context.TODO(), opts, "default-ns", kubeClient)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "waiting for valuesFrom")
 }

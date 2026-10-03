@@ -390,6 +390,15 @@ const (
 	// distinguishes that temporary wait from an actual deployment error,
 	// which uses the default "Error" reason.
 	BundleDeploymentReasonWaitingForDependency = "WaitingForDependency"
+	// BundleDeploymentReasonWaitingForValuesFrom is the reason set on the
+	// Deployed condition when a bundle using several helm.valuesFrom sources
+	// cannot resolve all of them yet, because a referenced ConfigMap or
+	// Secret is missing, its key is missing, or its values document is empty.
+	// That is a temporary wait aggregated as WaitApplied, not a deployment
+	// error: already resolved values and the currently deployed release are
+	// left untouched, and once the sources recover the same revision is
+	// deployed on the next reconcile.
+	BundleDeploymentReasonWaitingForValuesFrom = "WaitingForValuesFrom"
 )
 
 type BundleStatus struct {

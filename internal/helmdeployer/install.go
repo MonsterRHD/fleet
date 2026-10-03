@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
@@ -490,6 +492,88 @@ func handleOrphanedRelease(ctx context.Context, cfg *action.Configuration, lastR
 	return false, nil
 }
 
+// Reasons reported on PendingValuesFrom. They only describe the wait, the
+// caller decides whether a given condition is retriable or an error.
+const (
+	// PendingValuesFromNotFound means the referenced ConfigMap or Secret object does not exist.
+	PendingValuesFromNotFound = "notFound"
+	// PendingValuesFromKeyMissing means the object exists, but not the referenced key.
+	PendingValuesFromKeyMissing = "keyMissing"
+	// PendingValuesFromEmpty means object and key exist, but the values document is empty.
+	PendingValuesFromEmpty = "empty"
+)
+
+// PendingValuesFrom describes one valuesFrom source which could not be
+// resolved yet, because its ConfigMap/Secret is missing, its key is missing or
+// its values document is empty.
+type PendingValuesFrom struct {
+	// Kind is "ConfigMap" or "Secret".
+	Kind string
+	// Name and Namespace identify the source object. Namespace is the
+	// effectively used namespace, defaulting to the Helm release namespace.
+	Name      string
+	Namespace string
+	// Key is the effectively used key, defaulting to DefaultKey.
+	Key    string
+	Reason string
+}
+
+func (p PendingValuesFrom) String() string {
+	switch p.Reason {
+	case PendingValuesFromNotFound:
+		return fmt.Sprintf("%s %s/%s not found", strings.ToLower(p.Kind), p.Namespace, p.Name)
+	case PendingValuesFromKeyMissing:
+		return fmt.Sprintf("%s %s/%s has no key %q", strings.ToLower(p.Kind), p.Namespace, p.Name, p.Key)
+	default:
+		return fmt.Sprintf("%s %s/%s has no values under key %q", strings.ToLower(p.Kind), p.Namespace, p.Name, p.Key)
+	}
+}
+
+// WaitingForValuesFromError is returned while a bundle uses several
+// valuesFrom sources and one or more of them are missing or empty. It is a
+// temporary condition, not a deployment failure: the sources are meant to be
+// merged in declaration order, so deploying without the missing ones would
+// drop or fail to override their keys. The caller should keep the currently
+// deployed release and the already resolved values untouched and retry, which
+// applies the unchanged deployment revision once every source is available.
+type WaitingForValuesFromError struct {
+	// Pending lists every source that could not be resolved in this pass.
+	Pending []PendingValuesFrom
+	// Values holds the inline values merged with the sources that were
+	// resolved so far, in declaration order. They are not deployed while the
+	// wait lasts and are retained for logging and diagnostics only.
+	Values map[string]any
+}
+
+func (e *WaitingForValuesFromError) Error() string {
+	pending := make([]string, 0, len(e.Pending))
+	for _, p := range e.Pending {
+		pending = append(pending, p.String())
+	}
+	return "waiting for valuesFrom sources to become available: " + strings.Join(pending, "; ")
+}
+
+// PendingDescriptions returns one human readable description per pending
+// source. Loggers reflect over the slice instead of calling Error, so they
+// should use this rather than Error.
+func (e *WaitingForValuesFromError) PendingDescriptions() []string {
+	pending := make([]string, 0, len(e.Pending))
+	for _, p := range e.Pending {
+		pending = append(pending, p.String())
+	}
+	return pending
+}
+
+// valuesFromSource identifies one valuesFrom ConfigMap or Secret reference,
+// after resolving it from a ValuesFrom entry.
+type valuesFromSource struct {
+	// kind is "ConfigMap" or "Secret".
+	kind               string
+	name               string
+	namespace          string
+	key                string
+}
+
 func (h *Helm) getValues(ctx context.Context, options fleet.BundleDeploymentOptions, defaultNamespace string, kubeClient kubernetes.Interface) (map[string]any, error) {
 	if options.Helm == nil {
 		return nil, nil
@@ -505,56 +589,44 @@ func (h *Helm) getValues(ctx context.Context, options fleet.BundleDeploymentOpti
 		values = map[string]any{}
 	}
 	// kubeClient is nil in template mode; skip the cluster lookups in that case.
-	if kubeClient != nil {
-		for _, valuesFrom := range options.Helm.ValuesFrom {
-			var tempValues map[string]any
-			if valuesFrom.ConfigMapKeyRef != nil {
-				name := valuesFrom.ConfigMapKeyRef.Name
-				namespace := valuesFrom.ConfigMapKeyRef.Namespace
-				if namespace == "" || isInDownstreamResources(name, "ConfigMap", options) {
-					// If the namespace is not set, or if the ConfigMap is part of the copied resources,
-					// we assume it is in the default namespace of the Helm release.
-					namespace = defaultNamespace
-				}
-				key := valuesFrom.ConfigMapKeyRef.Key
-				if key == "" {
-					key = DefaultKey
-				}
-				configMap, err := kubeClient.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
-				if err != nil {
-					return nil, err
-				}
-				tempValues, err = valuesFromConfigMap(name, namespace, key, configMap)
-				if err != nil {
-					return nil, err
-				}
-			}
-			if tempValues != nil {
-				values = mergeValues(values, tempValues)
-				tempValues = nil
-			}
+	if kubeClient == nil {
+		return values, nil
+	}
 
-			// merge secret last to be compatible with fleet <= 0.6.0
-			if valuesFrom.SecretKeyRef != nil {
-				name := valuesFrom.SecretKeyRef.Name
-				namespace := valuesFrom.SecretKeyRef.Namespace
-				if namespace == "" || isInDownstreamResources(name, "Secret", options) {
-					// If the namespace is not set, or if the Secret is part of the copied resources,
-					// we assume it is in the default namespace of the Helm release.
-					namespace = defaultNamespace
-				}
-				key := valuesFrom.SecretKeyRef.Key
-				if key == "" {
-					key = DefaultKey
-				}
-				secret, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
-				if err != nil {
-					return nil, err
-				}
-				tempValues, err = valuesFromSecret(name, namespace, key, secret)
-				if err != nil {
-					return nil, err
-				}
+	// With several valuesFrom sources, those are merged in declaration order,
+	// with later keys overriding earlier ones. A source that is still missing
+	// or empty is a temporary wait (see WaitingForValuesFromError), instead of
+	// failing the deployment with partial values or discarding the values
+	// already resolved. Bundles without valuesFrom, or with a single source,
+	// keep the historical behaviour where an unresolved source fails the
+	// deployment.
+	multiSource := len(options.Helm.ValuesFrom) > 1
+	var pending []PendingValuesFrom
+
+	for _, valuesFrom := range options.Helm.ValuesFrom {
+		// The secret is merged after the configmap within one entry to stay
+		// compatible with fleet <= 0.6.0.
+		refs := make([]valuesFromSource, 0, 2)
+		if valuesFrom.ConfigMapKeyRef != nil {
+			refs = append(refs, valuesFromSource{
+				kind: "ConfigMap", name: valuesFrom.ConfigMapKeyRef.Name,
+				namespace: valuesFrom.ConfigMapKeyRef.Namespace, key: valuesFrom.ConfigMapKeyRef.Key,
+			})
+		}
+		if valuesFrom.SecretKeyRef != nil {
+			refs = append(refs, valuesFromSource{
+				kind: "Secret", name: valuesFrom.SecretKeyRef.Name,
+				namespace: valuesFrom.SecretKeyRef.Namespace, key: valuesFrom.SecretKeyRef.Key,
+			})
+		}
+
+		for _, ref := range refs {
+			tempValues, pendingSource, err := h.resolveValuesFromSource(ctx, kubeClient, options, defaultNamespace, ref, multiSource)
+			if err != nil {
+				return nil, err
+			}
+			if pendingSource != nil {
+				pending = append(pending, *pendingSource)
 			}
 			if tempValues != nil {
 				values = mergeValues(values, tempValues)
@@ -562,7 +634,102 @@ func (h *Helm) getValues(ctx context.Context, options fleet.BundleDeploymentOpti
 		}
 	}
 
+	if len(pending) > 0 {
+		return values, &WaitingForValuesFromError{Pending: pending, Values: values}
+	}
+
 	return values, nil
+}
+
+// resolveValuesFromSource fetches and decodes one valuesFrom source. It
+// returns the decoded values (nil for an empty document), a non-nil
+// PendingValuesFrom when the source is missing, its key is missing or its
+// document is empty and waitOnMissing is true (i.e. the bundle uses several
+// sources), and a hard error otherwise. Malformed values and every error for a
+// single source are returned as errors to keep the historical behaviour.
+func (h *Helm) resolveValuesFromSource(
+	ctx context.Context,
+	kubeClient kubernetes.Interface,
+	options fleet.BundleDeploymentOptions,
+	defaultNamespace string,
+	ref valuesFromSource,
+	waitOnMissing bool,
+) (map[string]any, *PendingValuesFrom, error) {
+	namespace := ref.namespace
+	if namespace == "" || isInDownstreamResources(ref.name, ref.kind, options) {
+		// If the namespace is not set, or if the resource is part of the
+		// copied resources, we assume it is in the default namespace of the
+		// Helm release.
+		namespace = defaultNamespace
+	}
+	key := ref.key
+	if key == "" {
+		key = DefaultKey
+	}
+	pending := func(reason string) *PendingValuesFrom {
+		return &PendingValuesFrom{Kind: ref.kind, Name: ref.name, Namespace: namespace, Key: key, Reason: reason}
+	}
+
+	var (
+		tempValues map[string]any
+		err        error
+	)
+	switch ref.kind {
+	case "ConfigMap":
+		var configMap *corev1.ConfigMap
+		configMap, err = kubeClient.CoreV1().ConfigMaps(namespace).Get(ctx, ref.name, metav1.GetOptions{})
+		if err == nil {
+			tempValues, err = valuesFromConfigMap(ref.name, namespace, key, configMap)
+		}
+	case "Secret":
+		var secret *corev1.Secret
+		secret, err = kubeClient.CoreV1().Secrets(namespace).Get(ctx, ref.name, metav1.GetOptions{})
+		if err == nil {
+			tempValues, err = valuesFromSecret(ref.name, namespace, key, secret)
+		}
+	default:
+		return nil, nil, fmt.Errorf("unsupported valuesFrom kind %q", ref.kind)
+	}
+
+	if err != nil {
+		if waitOnMissing && apierrors.IsNotFound(err) {
+			return nil, pending(PendingValuesFromNotFound), nil
+		}
+		if p, ok := classifyValuesFromError(ref.kind, ref.name, namespace, key, waitOnMissing, err); ok {
+			return nil, &p, nil
+		}
+		return nil, nil, err
+	}
+
+	if tempValues == nil && waitOnMissing {
+		// Object and key exist, but the document contains no values.
+		return nil, pending(PendingValuesFromEmpty), nil
+	}
+
+	return tempValues, nil, nil
+}
+
+// classifyValuesFromError turns a "source not ready yet" decode error into a
+// PendingValuesFrom description when waitOnMissing is true (i.e. the bundle
+// uses several valuesFrom sources). Malformed values are never retriable and
+// fall through as a hard error, as do all errors for a single source, which
+// keeps the historical error behaviour.
+func classifyValuesFromError(kind, name, namespace, key string, waitOnMissing bool, err error) (PendingValuesFrom, bool) {
+	if !waitOnMissing || err == nil {
+		return PendingValuesFrom{}, false
+	}
+
+	var missingKey *valuesFromKeyMissingError
+	if errors.As(err, &missingKey) {
+		return PendingValuesFrom{Kind: kind, Name: name, Namespace: namespace, Key: key, Reason: PendingValuesFromKeyMissing}, true
+	}
+	if errors.Is(err, io.EOF) {
+		// An empty values document decodes to io.EOF; treat it like a source
+		// that has not been populated yet.
+		return PendingValuesFrom{Kind: kind, Name: name, Namespace: namespace, Key: key, Reason: PendingValuesFromEmpty}, true
+	}
+
+	return PendingValuesFrom{}, false
 }
 
 // restConfigGetter produces a *rest.Config. Both
@@ -580,6 +747,22 @@ func kubeClientFromGetter(getter restConfigGetter) (kubernetes.Interface, error)
 	return kubernetes.NewForConfig(restConfig)
 }
 
+// valuesFromKeyMissingError is returned when a referenced valuesFrom key is
+// absent from its ConfigMap or Secret. For a bundle with several sources it is
+// classified as a temporary wait; for a single source it keeps failing the
+// deployment as before. Its Error text is kept stable for backwards
+// compatibility.
+type valuesFromKeyMissingError struct {
+	kind      string
+	name      string
+	namespace string
+	key       string
+}
+
+func (e *valuesFromKeyMissingError) Error() string {
+	return fmt.Sprintf("key %s is missing from %s %s/%s, can't use it in valuesFrom", e.key, strings.ToLower(e.kind), e.namespace, e.name)
+}
+
 func valuesFromSecret(name, namespace, key string, secret *corev1.Secret) (map[string]any, error) {
 	var m map[string]any
 	if secret == nil {
@@ -588,7 +771,7 @@ func valuesFromSecret(name, namespace, key string, secret *corev1.Secret) (map[s
 
 	values, ok := secret.Data[key]
 	if !ok {
-		return nil, fmt.Errorf("key %s is missing from secret %s/%s, can't use it in valuesFrom", key, namespace, name)
+		return nil, &valuesFromKeyMissingError{kind: "Secret", name: name, namespace: namespace, key: key}
 	}
 	if err := yaml.NewYAMLToJSONDecoder(bytes.NewBuffer(values)).Decode(&m); err != nil {
 		return nil, err
@@ -604,7 +787,7 @@ func valuesFromConfigMap(name, namespace, key string, configMap *corev1.ConfigMa
 
 	values, ok := configMap.Data[key]
 	if !ok {
-		return nil, fmt.Errorf("key %s is missing from configmap %s/%s, can't use it in valuesFrom", key, namespace, name)
+		return nil, &valuesFromKeyMissingError{kind: "ConfigMap", name: name, namespace: namespace, key: key}
 	}
 	if err := yaml.NewYAMLToJSONDecoder(bytes.NewBufferString(values)).Decode(&m); err != nil {
 		return nil, err
@@ -619,8 +802,15 @@ func mergeMaps(base, other map[string]string) map[string]string {
 	return result
 }
 
-// mergeValues merges source and destination map, preferring values over maps
-// from the source values. This is slightly adapted from:
+// mergeValues merges the src map into dest and returns dest. It is called once
+// per valuesFrom source, in declaration order, so keys from a later source
+// override keys from an earlier source (or from the inline helm values):
+//   - when both sides hold a map for the same key, they are deep merged, again
+//     with src winning on conflicts;
+//   - any non-map value (scalars, slices, ...) from src replaces the value in
+//     dest.
+//
+// dest is mutated. This is slightly adapted from:
 // https://github.com/helm/helm/blob/2332b480c9cb70a0d8a85247992d6155fbe82416/cmd/helm/install.go#L359
 func mergeValues(dest, src map[string]any) map[string]any {
 	for k, v := range src {
