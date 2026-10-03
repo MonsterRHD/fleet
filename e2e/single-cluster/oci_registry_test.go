@@ -886,20 +886,27 @@ var _ = Describe("Single Cluster Deployments using OCI registry", Label("oci-reg
 					Expect(err).ToNot(HaveOccurred())
 				})
 				By("creating 1 event to warn the user that the previous oci artifact could not be deleted", func() {
-					var events corev1.EventList
-					err := clientUpstream.List(context.TODO(), &events, &client.ListOptions{Namespace: env.Namespace})
-					Expect(err).ToNot(HaveOccurred())
+					// The old generation is garbage-collected by the bundle
+					// controller once the BundleDeployment switched. The
+					// deletion keeps failing with the no-deleter user, so the
+					// controller emits a Warning event (aggregated into one)
+					// and retries on later reconciles.
+					Eventually(func(g Gomega) {
+						var events corev1.EventList
+						err := clientUpstream.List(context.TODO(), &events, &client.ListOptions{Namespace: env.Namespace})
+						g.Expect(err).ToNot(HaveOccurred())
 
-					var ociEvents []corev1.Event
-					for _, event := range events.Items {
-						if strings.Contains(event.Message, previousContentsID) &&
-							strings.Contains(event.Message, "deleting OCI artifact") &&
-							event.Reason == "FailedToDeleteOCIArtifact" &&
-							event.Source.Component == "fleet-apply" {
-							ociEvents = append(ociEvents, event)
+						var ociEvents []corev1.Event
+						for _, event := range events.Items {
+							if strings.Contains(event.Message, previousContentsID) &&
+								strings.Contains(event.Message, "deleting OCI artifact") &&
+								event.Reason == "FailedToDeleteOCIArtifact" &&
+								event.Source.Component == "fleet-bundle-ctrl" {
+								ociEvents = append(ociEvents, event)
+							}
 						}
-					}
-					Expect(ociEvents).To(HaveLen(1))
+						g.Expect(ociEvents).To(HaveLen(1))
+					}).Should(Succeed())
 				})
 			})
 		})

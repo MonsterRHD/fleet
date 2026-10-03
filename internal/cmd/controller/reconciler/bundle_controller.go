@@ -470,6 +470,17 @@ func (r *BundleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, errutil.NewAggregate(merr)
 	}
 
+	// The switch to the new generation is persisted. Garbage-collect older
+	// OCI generations once their ContentsID is no longer referenced by any
+	// BundleDeployment. Deletion failures are best-effort and never block
+	// the new generation.
+	if contentsInOCI {
+		if err := r.cleanupUnreferencedOCIArtifacts(ctx, bundle); err != nil {
+			logger.Error(err, "Failed to garbage collect unreferenced OCI artifacts")
+			merr = append(merr, fmt.Errorf("%w: %w", fleetutil.ErrRetryable, err))
+		}
+	}
+
 	if secretsMissing {
 		// At least one BundleDeployment had its options secret transiently
 		// unavailable. Requeue so we can retry loading those values; we cannot
@@ -497,6 +508,13 @@ func (r *BundleReconciler) handleDelete(ctx context.Context, logger logr.Logger,
 	if len(bds) > 0 {
 		logger.V(1).Info("Bundle deleted, purging bundle deployments")
 		return ctrl.Result{RequeueAfter: requeueAfterBundleDeploymentCleanup}, batchDeleteBundleDeployments(ctx, r.Client, bds)
+	}
+
+	// All BundleDeployments are gone, so older OCI generations are no
+	// longer referenced. Best-effort garbage-collect them before removing
+	// the current generation.
+	if err := r.cleanupUnreferencedOCIArtifacts(ctx, bundle); err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if err := r.maybeDeleteOCIArtifact(ctx, bundle); err != nil {

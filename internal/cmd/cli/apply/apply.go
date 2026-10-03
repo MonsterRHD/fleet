@@ -23,14 +23,12 @@ import (
 	"github.com/rancher/fleet/internal/names"
 	"github.com/rancher/fleet/internal/ocistorage"
 	fleet "github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
-	fleetevent "github.com/rancher/fleet/pkg/event"
 	"github.com/rancher/fleet/pkg/helmvalues"
 
 	"github.com/rancher/wrangler/v3/pkg/yaml"
 	"golang.org/x/sync/semaphore"
 	k8syaml "sigs.k8s.io/yaml"
 
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -244,7 +242,7 @@ func CreateBundles(ctx context.Context, client client.Client, r record.EventReco
 		}
 		writeWg.Go(func() {
 			defer writeSemaphore.Release(1)
-			if err := writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts); err != nil {
+			if err := writeBundle(ctx, client, b.bundle, b.scans, *b.opts); err != nil {
 				writeErrorChan <- fmt.Errorf("%s: %w", b.bundle.Name, err)
 			}
 		})
@@ -354,7 +352,7 @@ func CreateBundlesDriven(ctx context.Context, client client.Client, r record.Eve
 		}
 		writeWg.Go(func() {
 			defer writeSemaphore.Release(1)
-			if err := writeBundle(ctx, client, r, b.bundle, b.scans, *b.opts); err != nil {
+			if err := writeBundle(ctx, client, b.bundle, b.scans, *b.opts); err != nil {
 				writeErrorChan <- fmt.Errorf("%s: %w", b.bundle.Name, err)
 			}
 		})
@@ -536,7 +534,7 @@ func bundleFromDir(ctx context.Context, name, baseDir string, opts Options) (*fl
 	return bundle, scans, nil
 }
 
-func writeBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, scans []*fleet.ImageScan, opts Options) error {
+func writeBundle(ctx context.Context, c client.Client, bundle *fleet.Bundle, scans []*fleet.ImageScan, opts Options) error {
 	// Early return for "offline" mode, only printing the result to stdout/file
 	if opts.Output != nil {
 		return printToOutput(opts.Output, bundle, scans)
@@ -572,7 +570,7 @@ func writeBundle(ctx context.Context, c client.Client, r record.EventRecorder, b
 		return err
 	}
 	if useOCIRegistry {
-		if bundle, err = saveOCIBundle(ctx, c, r, bundle, ociOpts); err != nil {
+		if bundle, err = saveOCIBundle(ctx, c, bundle, ociOpts); err != nil {
 			return err
 		}
 	} else {
@@ -642,13 +640,24 @@ func shouldStoreInOCIRegistry(ctx context.Context, c client.Reader, ociSecretKey
 	return true, nil
 }
 
+// ociManifestStore can push fleet manifests to an OCI registry.
+type ociManifestStore interface {
+	PushManifest(ctx context.Context, opts ocistorage.OCIOpts, id string, m *manifest.Manifest) error
+}
+
+// newOCIManifestStore builds the client used to push manifests to the OCI
+// registry. It is a variable so tests can replace the registry client.
+var newOCIManifestStore = func() ociManifestStore {
+	return ocistorage.NewOCIWrapper()
+}
+
 func pushOCIManifest(ctx context.Context, bundle *fleet.Bundle, opts ocistorage.OCIOpts) (string, error) {
 	manifest := manifest.FromBundle(bundle)
 	manifestID, err := manifest.ID()
 	if err != nil {
 		return "", err
 	}
-	oci := ocistorage.NewOCIWrapper()
+	oci := newOCIManifestStore()
 	err = oci.PushManifest(ctx, opts, manifestID, manifest)
 	if err != nil {
 		return "", err
@@ -711,32 +720,46 @@ func saveImageScans(ctx context.Context, c client.Client, bundle *fleet.Bundle, 
 	return nil
 }
 
-func saveOCIBundle(ctx context.Context, c client.Client, r record.EventRecorder, bundle *fleet.Bundle, opts ocistorage.OCIOpts) (*fleet.Bundle, error) {
+// saveOCIBundle stores the bundle's resources in an OCI registry and points
+// the Bundle at the new generation.
+//
+// When updating a Bundle that already uses OCI storage, the switch is
+// ordered: the new OCI artifact and the access Secret for it are written
+// first, so that a complete, readable generation exists before the Bundle
+// (and, through it, its BundleDeployments) is switched to the new
+// ContentsID. No mutation happens if pushing the artifact or writing the
+// Secret fails, which keeps existing deployments on the previous
+// generation and allows later syncs to retry. Old generations are never
+// deleted here: the bundle controller garbage-collects their artifacts and
+// Secrets once no BundleDeployment references the old ContentsID anymore.
+func saveOCIBundle(ctx context.Context, c client.Client, bundle *fleet.Bundle, opts ocistorage.OCIOpts) (*fleet.Bundle, error) {
 	manifestID, err := pushOCIManifest(ctx, bundle, opts)
 	if err != nil {
 		return bundle, err
 	}
 	log.Log.Info(fmt.Sprintf("OCI artifact stored successfully: %s %s", bundle.Name, manifestID))
 
+	// Look up the currently published generation, if any.
+	existing := &fleet.Bundle{}
+	if err := c.Get(ctx, client.ObjectKey{Name: bundle.Name, Namespace: bundle.Namespace}, existing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, err
+		}
+		existing = nil
+	}
+	previousContentsID := ""
+	if existing != nil {
+		previousContentsID = existing.Spec.ContentsID
+	}
+
 	updated := bundle.DeepCopy()
-	_, err = controllerutil.CreateOrUpdate(ctx, c, bundle, func() error {
+	publishBundle := func() error {
 		if bundle.DeletionTimestamp != nil {
 			return fmt.Errorf("the bundle %q is being deleted", bundle.Name)
 		}
 
 		if bundle.Spec.HelmOpOptions != nil {
 			return fmt.Errorf("a helmOps bundle with name %q already exists", bundle.Name)
-		}
-
-		// If the current manifestID is different from the previous one,
-		// delete the previous OCI artifact
-		if bundle.Spec.ContentsID != "" && bundle.Spec.ContentsID != manifestID {
-			if err := deleteOCIManifest(ctx, c, bundle, opts); err != nil {
-				// we log the error and continue, since the OCI registry is an external entity to the cluster
-				// we may encounter various types of transient errors (such as connection or access issues).
-				log.Log.Info("deleting OCI artifact", "error", err)
-				sendWarningEvent(r, bundle.Namespace, bundle.Spec.ContentsID, err)
-			}
 		}
 
 		bundle.Spec = updated.Spec
@@ -748,23 +771,56 @@ func saveOCIBundle(ctx context.Context, c client.Client, r record.EventRecorder,
 		bundle.Spec.Resources = nil
 		bundle.Spec.ContentsID = manifestID
 		return nil
-	})
+	}
+
+	if previousContentsID != "" && previousContentsID != manifestID {
+		// Update of an OCI-backed Bundle. The access Secret for the new
+		// generation is written before the Bundle switches ContentsID, so
+		// the new generation is complete and readable before any
+		// BundleDeployment can be pointed at it.
+		if err := createOrUpdateOCISecret(ctx, c, manifestID, existing, opts); err != nil {
+			return nil, err
+		}
+
+		result, err := controllerutil.CreateOrUpdate(ctx, c, bundle, publishBundle)
+		if err != nil {
+			return nil, err
+		}
+		log.Log.Info(fmt.Sprintf("%s (bundle): %s/%s", result, bundle.Namespace, bundle.Name))
+
+		return bundle, nil
+	}
+
+	// First OCI publish, or a sync with unchanged content: publish the
+	// Bundle and then create the access Secret.
+	result, err := controllerutil.CreateOrUpdate(ctx, c, bundle, publishBundle)
 	if err != nil {
 		return nil, err
 	}
+	log.Log.Info(fmt.Sprintf("%s (bundle): %s/%s", result, bundle.Namespace, bundle.Name))
 
-	secret := newOCISecret(manifestID, bundle, opts)
+	if err := createOrUpdateOCISecret(ctx, c, manifestID, bundle, opts); err != nil {
+		return nil, err
+	}
+
+	return bundle, nil
+}
+
+// createOrUpdateOCISecret writes the OCI access Secret for the given
+// generation. The Secret is owned by owner, which must already exist.
+func createOrUpdateOCISecret(ctx context.Context, c client.Client, manifestID string, owner *fleet.Bundle, opts ocistorage.OCIOpts) error {
+	secret := newOCISecret(manifestID, owner, opts)
 	data := secret.Data
 	result, err := controllerutil.CreateOrUpdate(ctx, c, secret, func() error {
 		secret.Data = data
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	log.Log.Info(fmt.Sprintf("%s (oci secret): %s/%s", result, bundle.Namespace, bundle.Name))
+	log.Log.Info(fmt.Sprintf("%s (oci secret): %s/%s", result, secret.Namespace, secret.Name))
 
-	return bundle, nil
+	return nil
 }
 
 func deleteOCIManifest(ctx context.Context, c client.Client, bundle *fleet.Bundle, opts ocistorage.OCIOpts) error {
@@ -934,21 +990,6 @@ func deleteSecretIfExists(ctx context.Context, c client.Client, name, ns string)
 	}
 
 	return nil
-}
-
-func sendWarningEvent(r record.EventRecorder, namespace, artifactID string, errorToLog error) {
-	jobName := os.Getenv(JobNameEnvVar)
-	if jobName == "" {
-		log.Log.Info(fmt.Sprintf("%q environment variable not set", JobNameEnvVar))
-		return
-	}
-	job := &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      jobName,
-			Namespace: namespace,
-		},
-	}
-	r.Event(job, fleetevent.Warning, "FailedToDeleteOCIArtifact", fmt.Sprintf("deleting OCI artifact %q: %v", artifactID, errorToLog.Error()))
 }
 
 func setAuthByPath(opts *Options, path string) error {
